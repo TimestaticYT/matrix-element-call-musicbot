@@ -23,6 +23,8 @@ YTDLP_AUDIO_FORMAT_MAP = {
 }
 
 YTDLP_JS_RUNTIME = ["--js-runtimes", "node"]
+# yt-dlp fields used to show "Artist - Track" in chat
+TRACK_METADATA_KEYS = ("artist", "track", "album", "channel")
 
 
 class AudioQueue:
@@ -402,6 +404,10 @@ class AudioQueue:
             "duration": float(duration) if isinstance(duration, (int, float)) else None,
             "uploader": uploader,
             "stream_url": stream_url,
+            "artist": entry.get("artist") or "",
+            "track": entry.get("track") or "",
+            "album": entry.get("album") or "",
+            "channel": entry.get("channel") or entry.get("uploader") or "",
         }
         return True, out
 
@@ -437,6 +443,7 @@ class AudioQueue:
             "title": metadata.get("title") or os.path.basename(query_or_url) or "track",
             "duration": metadata.get("duration"),
             "uploader": metadata.get("uploader"),
+            **{key: metadata.get(key, "") for key in TRACK_METADATA_KEYS},
         }
 
     async def _resolve_direct_stream_url(self, dlp_cmd: str, target: str) -> tuple[bool, str]:
@@ -609,6 +616,7 @@ class AudioQueue:
                 "source_url": source_url,
                 "uploader": resolved["uploader"],
                 "non_cacheable": non_cacheable,
+                **{key: resolved.get(key, "") for key in TRACK_METADATA_KEYS},
             }
 
         url_hash = hashlib.md5(source_url.encode(), usedforsecurity=False).hexdigest()[:8]
@@ -718,6 +726,7 @@ class AudioQueue:
                 "source_url": source_url,
                 "uploader": resolved["uploader"],
                 "non_cacheable": non_cacheable,
+                **{key: resolved.get(key, "") for key in TRACK_METADATA_KEYS},
             }
         except Exception as exc:
             logger.error(f"Download exception: {exc}")
@@ -730,8 +739,9 @@ class AudioQueue:
         duration: Optional[float] = None,
         source_url: Optional[str] = None,
         non_cacheable: bool = False,
+        metadata: Optional[dict] = None,
     ):
-        """Add a track to queue."""
+        """Add a track to queue. `metadata` may carry yt-dlp artist/track/album/channel."""
         track = {
             "file": audio_file,
             "title": title or os.path.basename(audio_file),
@@ -739,6 +749,9 @@ class AudioQueue:
             "source_url": source_url,
             "non_cacheable": bool(non_cacheable),
         }
+        for key in TRACK_METADATA_KEYS:
+            value = (metadata or {}).get(key)
+            track[key] = value if isinstance(value, str) else ""
         self.queue.append(track)
         if duration is not None:
             logger.info(f"Added to queue: {track['title']} (duration: {duration:.2f}s)")

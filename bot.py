@@ -21,6 +21,57 @@ from saved_queues import SavedQueueStore
 logger = logging.getLogger(__name__)
 
 
+_TITLE_NOISE_RE = re.compile(
+    r"\s*[\(\[][^)\]]*"
+    r"(?:official|video|audio|lyrics?|hd|4k|"
+    r"remaster(?:ed)?|live|music\s*video|mv|"
+    r"visualizer|explicit|clean|extended)"
+    r"[^)\]]*[\)\]]\s*",
+    re.IGNORECASE,
+)
+_TOPIC_SUFFIX_RE = re.compile(r"\s*-\s*Topic\s*$", re.IGNORECASE)
+_ARTIST_TITLE_SEP_RE = re.compile(r"\s+[-\u2013\u2014]\s+")
+
+
+def _clean_title(title: str) -> str:
+    prev = None
+    cur = title
+    while prev != cur:
+        prev = cur
+        cur = _TITLE_NOISE_RE.sub(" ", cur).strip()
+    cur = _TOPIC_SUFFIX_RE.sub("", cur).strip()
+    return cur.strip(" -")
+
+
+def display_title(track: Optional[dict]) -> str:
+    """'Artist - Track' for chat messages, else the raw title.
+
+    Uses yt-dlp's artist/track when present, otherwise splits the title on " - "
+    or falls back to the channel name, with "(Official Video)"-style suffixes removed.
+    Ported from OolaaPleur/matrix-element-call-musicbot (extract_metadata).
+    """
+    if not isinstance(track, dict):
+        return ""
+    raw_title = str(track.get("title") or "")
+    artist = str(track.get("artist") or "").strip()
+    name = str(track.get("track") or "").strip()
+    if not (artist and name):
+        title = raw_title.strip()
+        artist, name = "", ""
+        parts = _ARTIST_TITLE_SEP_RE.split(title, maxsplit=1)
+        if len(parts) == 2:
+            left, right = parts
+            artist, name = _TOPIC_SUFFIX_RE.sub("", left).strip(), _clean_title(right)
+        if not (artist and name):
+            channel = _TOPIC_SUFFIX_RE.sub("", str(track.get("channel") or track.get("uploader") or "")).strip()
+            artist, name = channel, _clean_title(title)
+            if artist and name.casefold().startswith(artist.casefold()):
+                return name
+    if artist and name:
+        return f"{artist} - {name}"
+    return raw_title
+
+
 COMMAND_ALIASES = {
     "!h": "!help",
     "!j": "!join",
@@ -274,7 +325,7 @@ class IntegratedBot:
     def _format_track_line(cls, prefix: str, track: dict) -> str:
         duration = track.get("duration")
         duration_str = f" [{cls._format_duration(duration)}]" if duration is not None else ""
-        return f"{prefix}{track['title']}{duration_str}"
+        return f"{prefix}{display_title(track)}{duration_str}"
 
     @staticmethod
     def _format_bytes(num_bytes: int) -> str:
@@ -291,7 +342,7 @@ class IntegratedBot:
     def _next_track_title(self) -> Optional[str]:
         if not self.audio_queue.queue:
             return None
-        return self.audio_queue.queue[0]["title"]
+        return display_title(self.audio_queue.queue[0])
 
     @staticmethod
     def _sum_known_durations(tracks: list[dict]) -> Optional[float]:
@@ -590,7 +641,7 @@ class IntegratedBot:
                     self._current_track_started_at = previous_started_at
             return False
 
-        await self.send_message(room_id, f"▶️ Now playing: {title}")
+        await self.send_message(room_id, f"▶️ Now playing: {display_title(track) or title}")
 
         if self.config.STREAM_PREFETCH_CURRENT and isinstance(source_url, str) and source_url:
             self._stream_prefetch_task = asyncio.create_task(
@@ -848,6 +899,7 @@ class IntegratedBot:
                             track.get("duration"),
                             source_url=source_url,
                             non_cacheable=bool(track.get("non_cacheable")),
+                            metadata=track,
                         )
 
                     # A skip (or a short track) can empty the queue before the next download
@@ -996,7 +1048,7 @@ class IntegratedBot:
             generation, current_source = await self._play_track_in_worker(next_track, pre_stop=pre_stop)
             self._current_track_started_at = asyncio.get_running_loop().time()
             self._push_play_history(room_id, next_track)
-            await self.send_message(room_id, f"▶️ Now playing: {next_track['title']}{loop_indicator}")
+            await self.send_message(room_id, f"▶️ Now playing: {display_title(next_track)}{loop_indicator}")
             self._worker_playback_task = asyncio.create_task(
                 self._wait_for_worker_playback(room_id, generation, current_source)
             )
@@ -1012,7 +1064,7 @@ class IntegratedBot:
                 await self.send_message(room_id, "⚠️ Stream failed. Retrying from cached file...", priority="critical")
                 fallback_ok = await self._retry_stream_track_as_file(room_id, next_track)
                 if fallback_ok:
-                    await self.send_message(room_id, f"▶️ Now playing: {next_track['title']}")
+                    await self.send_message(room_id, f"▶️ Now playing: {display_title(next_track)}")
                     return
             self._current_track_started_at = None
             await self.send_message(room_id, f"❌ Failed to play in call: {exc}")
@@ -1188,6 +1240,7 @@ class IntegratedBot:
                             first_item.get("duration"),
                             source_url=first_item.get("source_url"),
                             non_cacheable=bool(first_item.get("non_cacheable")),
+                            metadata=first_item,
                         )
                         if not had_current:
                             await self._advance_queue(room.room_id, force_next=True)
@@ -1258,6 +1311,7 @@ class IntegratedBot:
                         duration,
                         source_url=source_url,
                         non_cacheable=bool(result.get("non_cacheable")),
+                        metadata=result,
                     )
 
                     if had_current:
@@ -1286,7 +1340,7 @@ class IntegratedBot:
                         next_title = self._next_track_title()
                         next_line = f"\nNext: {next_title}" if next_title else ""
                         queued_message = (
-                            f"✅ Queued: {title}\n"
+                            f"✅ Queued: {display_title(self.audio_queue.queue[-1]) or title}\n"
                             f"Position: {len(self.audio_queue.queue)}"
                             f"{eta_line}{next_line}"
                         )
@@ -1640,6 +1694,7 @@ class IntegratedBot:
                     first_item.get("duration"),
                     source_url=first_item.get("source_url"),
                     non_cacheable=bool(first_item.get("non_cacheable")),
+                    metadata=first_item,
                 )
 
                 await self._advance_queue(room.room_id, force_next=True)
