@@ -45,6 +45,7 @@ class Config:
         "worker.log_backups": 5,
         "playlist.max_tracks_per_request": 50,
         "playlist.background_load_concurrency": 4,
+        "playlist.preload_ahead": 3,
         "logging.file": "logs/musicbot.log",
         "logging.clean_enabled": True,
         "logging.clean_file": "logs/musicbot.clean.log",
@@ -272,6 +273,14 @@ class Config:
             "background_load_concurrency",
             self.DEFAULTS["playlist.background_load_concurrency"],
         )
+        # Playlists/saved queues are downloaded just in time: keep this many tracks
+        # downloaded and waiting in the queue (no gap between songs, bounded disk use).
+        self.PLAYLIST_PRELOAD_AHEAD = min(20, max(1, self._get_nonnegative_int(
+            "PLAYLIST_PRELOAD_AHEAD",
+            "playlist",
+            "preload_ahead",
+            self.DEFAULTS["playlist.preload_ahead"],
+        )))
         self.PROXY = self._get_str("PROXY", "audio", "proxy", self.DEFAULTS["audio.proxy"])
 
         if self.PLAYLIST_BACKGROUND_LOAD_CONCURRENCY < 1:
@@ -434,6 +443,7 @@ class Config:
             f"worker.log_backups = {cls.DEFAULTS['worker.log_backups']}",
             f"playlist.max_tracks_per_request = {cls.DEFAULTS['playlist.max_tracks_per_request']}",
             f"playlist.background_load_concurrency = {cls.DEFAULTS['playlist.background_load_concurrency']}",
+            f"playlist.preload_ahead = {cls.DEFAULTS['playlist.preload_ahead']}",
             f"logging.file = {cls.DEFAULTS['logging.file']}",
             f"logging.clean_enabled = {str(cls.DEFAULTS['logging.clean_enabled']).lower()}",
             f"logging.clean_file = {cls.DEFAULTS['logging.clean_file']}",

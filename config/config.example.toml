@@ -58,7 +58,8 @@ log_backups = 5
 
 [playlist]
 max_tracks_per_request = 50
-background_load_concurrency = 4
+background_load_concurrency = 4 # max parallel downloads within the preload window
+preload_ahead = 3 # tracks kept downloaded ahead in the queue (1-20); the rest download as the queue plays
 
 [logging]
 file = "logs/musicbot.log"

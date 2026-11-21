@@ -1,9 +1,10 @@
-import re
 import asyncio
 from collections import defaultdict, deque
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+import random
+import re
 import shutil
 import subprocess
 import time
@@ -38,6 +39,9 @@ COMMAND_ALIASES = {
     "!unpause": "!resume",
     "!rs": "!resume",
     "!lp": "!loop",
+    "!sh": "!shuffle",
+    "!random": "!shuffle",
+    "!rnd": "!shuffle",
     "!x": "!stop",
     "!st": "!status",
     "!sv": "!save",
@@ -87,6 +91,8 @@ class IntegratedBot:
         self._advance_watchdog_task: Optional[asyncio.Task] = None
         self._worker_playback_task: Optional[asyncio.Task] = None
         self._background_load_task: Optional[asyncio.Task] = None
+        # Playlist/saved-queue sources the background loader hasn't downloaded yet
+        self._pending_sources: Optional[deque[str]] = None
         self._stream_prefetch_task: Optional[asyncio.Task] = None
         self._current_room_id: Optional[str] = None
         self._current_track_started_at: Optional[float] = None
@@ -327,6 +333,7 @@ class IntegratedBot:
             "!resume (!rs) - resume after pause\n"
             "!stop (!x) - stop playback and clear queue\n"
             "!loop (!lp) - toggle loop mode\n"
+            "!shuffle (!sh) - shuffle the upcoming tracks\n"
             "!history (!hist) - show recent playback history\n\n"
             "Saved Queues\n"
             "!save (!sv) <name> [--force] - save current+upcoming queue\n"
@@ -707,6 +714,7 @@ class IntegratedBot:
             self._background_load_task.cancel()
             logger.info("Cancelled background queue loader")
         self._background_load_task = None
+        self._pending_sources = None
         self._cancel_stream_prefetch()
 
     async def _wait_for_worker_playback(
@@ -789,70 +797,79 @@ class IntegratedBot:
         dedupe_existing: bool,
         source_label: str,
     ):
+        """Download the rest of a playlist/saved queue just in time.
+
+        Keeps up to PLAYLIST_PRELOAD_AHEAD downloaded tracks waiting in the queue so
+        the next song is always ready (no gap between tracks), instead of downloading
+        the whole playlist up front, which delayed every track until all were done and
+        pushed earlier files out of the size-limited cache. Sources that are not
+        downloaded yet live in self._pending_sources (shared with shuffle/save/queue).
+        """
         if not remaining_sources:
             return
 
-        semaphore = asyncio.Semaphore(self.config.PLAYLIST_BACKGROUND_LOAD_CONCURRENCY)
-
-        async def load_one(index: int, source_url: str):
-            async with semaphore:
-                ok, result = await self.audio_queue.download_audio(source_url)
-                return index, ok, result
-
-        try:
-            tasks = [asyncio.create_task(load_one(idx, src)) for idx, src in enumerate(remaining_sources)]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        except asyncio.CancelledError:
-            return
-
-        loaded: list[dict] = []
+        pending: deque[str] = deque(remaining_sources)
+        self._pending_sources = pending
+        ahead = self.config.PLAYLIST_PRELOAD_AHEAD
+        parallel = self.config.PLAYLIST_BACKGROUND_LOAD_CONCURRENCY
         failures = 0
-        ordered: list[tuple[int, bool, object]] = []
-        for item in results:
-            if isinstance(item, Exception):
-                failures += 1
-                continue
-            if not isinstance(item, tuple) or len(item) != 3:
-                failures += 1
-                continue
-            ordered.append(item)
-
-        ordered.sort(key=lambda x: x[0])
-        for _, ok, result in ordered:
-            if not ok or not isinstance(result, dict):
-                failures += 1
-                continue
-            loaded.append(result)
-
-        if not loaded and failures == 0:
-            return
-
-        added = 0
         skipped_existing = 0
-        async with self._playback_lock:
-            for track in loaded:
-                source_url = track.get("source_url")
-                if dedupe_existing and isinstance(source_url, str) and source_url and self.audio_queue.has_source(source_url):
-                    skipped_existing += 1
+        try:
+            while pending:
+                free = ahead - len(self.audio_queue.queue)
+                if free <= 0:
+                    await asyncio.sleep(1.0)
                     continue
-                self.audio_queue.add_to_queue(
-                    track["file"],
-                    track.get("title"),
-                    track.get("duration"),
-                    source_url=source_url,
-                    non_cacheable=bool(track.get("non_cacheable")),
-                )
-                added += 1
 
-        if added:
-            message = f"✅ Added {added} more from {source_label} `{collection_name}`"
-            if skipped_existing:
-                message += f"\nSkipped already queued: {skipped_existing}"
+                batch = [pending.popleft() for _ in range(min(free, parallel, len(pending)))]
+                results = await asyncio.gather(
+                    *(self.audio_queue.download_audio(src) for src in batch),
+                    return_exceptions=True,
+                )
+
+                async with self._playback_lock:
+                    for result in results:
+                        if isinstance(result, BaseException) or not result[0] or not isinstance(result[1], dict):
+                            failures += 1
+                            continue
+                        track = result[1]
+                        source_url = track.get("source_url")
+                        if (
+                            dedupe_existing
+                            and isinstance(source_url, str)
+                            and source_url
+                            and self.audio_queue.has_source(source_url)
+                        ):
+                            skipped_existing += 1
+                            continue
+                        self.audio_queue.add_to_queue(
+                            track["file"],
+                            track.get("title"),
+                            track.get("duration"),
+                            source_url=source_url,
+                            non_cacheable=bool(track.get("non_cacheable")),
+                        )
+
+                    # A skip (or a short track) can empty the queue before the next download
+                    # finishes; playback has then stopped, so start the newly loaded track.
+                    if (
+                        self.audio_queue.current is None
+                        and self.audio_queue.queue
+                        and self._is_joined_in_room_call(room_id)
+                    ):
+                        logger.info("Background loader: playback ran dry, starting the newly loaded track")
+                        await self._advance_queue(room_id, force_next=True)
+        finally:
+            if self._pending_sources is pending:
+                self._pending_sources = None
+
+        if failures or skipped_existing:
+            parts = []
             if failures:
-                message += f"\nFailed: {failures}"
-            await self.send_message(room_id, message)
-        elif failures:
-            await self.send_message(room_id, f"⚠️ Failed to load {failures} from {source_label} `{collection_name}`")
+                parts.append(f"failed: {failures}")
+            if skipped_existing:
+                parts.append(f"skipped already queued: {skipped_existing}")
+            await self.send_message(room_id, f"⚠️ {source_label.capitalize()} `{collection_name}`: " + ", ".join(parts))
 
     async def _on_call_worker_event(self, event: dict):
         event_name = event.get("event")
@@ -1045,6 +1062,7 @@ class IntegratedBot:
             "!pause",
             "!resume",
             "!loop",
+            "!shuffle",
             "!stop",
             "!status",
         ]
@@ -1189,7 +1207,10 @@ class IntegratedBot:
 
                     summary = [f"✅ Playlist `{playlist_name}`: added {loaded_count} track"]
                     if remaining_sources:
-                        summary.append(f"ℹ️ Loading {len(remaining_sources)} more in background")
+                        summary.append(
+                            f"ℹ️ {len(remaining_sources)} more queued, downloaded as it plays "
+                            f"({self.config.PLAYLIST_PRELOAD_AHEAD} kept ready ahead)"
+                        )
                     if skipped_existing:
                         summary.append(f"Skipped already queued: {skipped_existing}")
                     if over_limit_skipped:
@@ -1319,6 +1340,10 @@ class IntegratedBot:
                 else:
                     total_duration = max(0.0, total_duration - float(current_duration) + current_remaining)
             total_label = self._format_duration(total_duration) if total_duration is not None else "unknown"
+            pending_count = len(self._pending_sources) if self._pending_sources else 0
+            if pending_count:
+                lines.append(f"… +{pending_count} more (downloaded as the queue plays)")
+                total_label += f" + {pending_count} not yet loaded"
             lines.append("")
             lines.append(f"Total: {total_label}")
 
@@ -1491,6 +1516,9 @@ class IntegratedBot:
                 else:
                     skipped += 1
 
+            for source_url in list(self._pending_sources or []):
+                snapshot.append({"source_url": source_url, "title": None, "duration": None})
+
             if not snapshot:
                 await self.send_message(room.room_id, "❌ Nothing saveable in queue right now")
                 return
@@ -1627,7 +1655,10 @@ class IntegratedBot:
                         source_label="saved queue",
                     )
                 )
-                await self.send_message(room.room_id, f"ℹ️ Loading {len(remaining_sources)} more...")
+                await self.send_message(
+                    room.room_id,
+                    f"ℹ️ {len(remaining_sources)} more queued, downloaded as it plays",
+                )
             elif failures:
                 await self.send_message(room.room_id, f"⚠️ Failed: {failures}")
             return
@@ -1687,6 +1718,39 @@ class IntegratedBot:
                         )
                     reply = "▶️ Resumed"
             await self.send_message(room.room_id, reply)
+            return
+
+        if command == "!shuffle":
+            async with self._playback_lock:
+                pending = self._pending_sources
+                if pending:
+                    # Mix the not-yet-downloaded sources with the preloaded ones: the
+                    # preloaded tracks go back into the pool (their files stay cached,
+                    # so the loader re-adds them instantly if they come up first).
+                    pool = list(pending)
+                    keep = []
+                    for item in self.audio_queue.queue:
+                        src = item.get("source_url")
+                        if src:
+                            pool.append(src)
+                        else:
+                            keep.append(item)
+                    random.shuffle(pool)
+                    self.audio_queue.queue.clear()
+                    self.audio_queue.queue.extend(keep)
+                    pending.clear()
+                    pending.extend(pool)
+                    total = len(pool) + len(keep)
+                else:
+                    queued = list(self.audio_queue.queue)
+                    random.shuffle(queued)
+                    self.audio_queue.queue.clear()
+                    self.audio_queue.queue.extend(queued)
+                    total = len(queued)
+            if total < 2:
+                await self.send_message(room.room_id, "ℹ️ Nothing to shuffle (fewer than 2 upcoming tracks)")
+            else:
+                await self.send_message(room.room_id, f"🔀 Shuffled {total} upcoming tracks")
             return
 
         if command == "!loop":

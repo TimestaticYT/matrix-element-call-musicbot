@@ -7,7 +7,7 @@ Discord-style music bot UX for Matrix: chat commands (`!play`, `!queue`, `!skip`
 - Discord-style chat command workflow in Matrix rooms
 - Joins Element Call and plays audio directly in call
 - URL or search-based playback with queue and ETA
-- Playlists supported
+- Playlists supported, downloaded just in time (`playlist.preload_ahead` tracks kept ready, so no gap between songs)
 - Saved queue presets (`save`, `load`, `rename`, `delete`)
 - Playback history and now-playing visibility
 - Audio controls (volume, fade-in, normalization)
@@ -101,6 +101,7 @@ command_prefix = "!mb"   # e.g. "!music"; set "" for the classic "!play" style
 - `!resume` (`!rs`) - resume after pause
 - `!stop` (`!x`) - stop playback and clear queue
 - `!loop` (`!lp`) - toggle loop mode
+- `!shuffle` (`!sh`) - shuffle the upcoming tracks (including ones not downloaded yet)
 - `!history` (`!hist`) - show recent playback history
 
 ### Saved Queues
