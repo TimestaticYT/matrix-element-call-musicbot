@@ -47,6 +47,18 @@ function normalizeVolumePercent(value) {
     return bounded;
 }
 
+// Volume percent -> linear gain on a logarithmic (dB) curve, which matches how loud
+// it sounds far better than a linear one (upstream PR #19). 0-100% spans -40..0 dB,
+// 100-200% spans 0..+6 dB (gain 2.0 at 200%, same maximum as the old linear curve).
+function volumeGain(percent) {
+    const p = normalizeVolumePercent(percent);
+    if (p <= 0) {
+        return 0;
+    }
+    const dB = p <= 100 ? 40 * (p / 100 - 1) : 6.02 * (p / 100 - 1);
+    return Math.pow(10, dB / 20);
+}
+
 function parseBoolEnv(name, defaultValue) {
     const raw = process.env[name];
     if (!raw) return defaultValue;
@@ -408,13 +420,13 @@ class CallWorker {
         this.playbackQueue = Promise.resolve();
         this.paused = false;
         this.resumeWaiters = [];
-        this.currentVolumeGain = normalizeVolumePercent(audioSettings.volumePercent) / 100;
+        this.currentVolumeGain = volumeGain(audioSettings.volumePercent);
         this.targetVolumeGain = this.currentVolumeGain;
     }
 
     setVolumePercent(value) {
         const normalizedPercent = normalizeVolumePercent(value);
-        this.targetVolumeGain = normalizedPercent / 100;
+        this.targetVolumeGain = volumeGain(normalizedPercent);
         audioSettings.volumePercent = normalizedPercent;
         logLine(`volume target updated percent=${normalizedPercent} gain=${this.targetVolumeGain.toFixed(3)}`);
     }
