@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 from typing import Awaitable, Callable, Optional
+from urllib.parse import urlparse
 
 from nio import AsyncClient, InviteMemberEvent, MatrixRoom, RoomMessageText
 
@@ -17,6 +18,7 @@ from audio_queue import AudioQueue, is_permanent_download_error
 from call_worker_process import CallWorkerProcess
 from saved_queues import SavedQueueStore
 from spotify import SpotifyError, is_spotify_link, resolve_spotify
+from radio import RadioError, resolve_radio_stream
 
 
 logger = logging.getLogger(__name__)
@@ -72,12 +74,25 @@ def display_title(track: Optional[dict]) -> str:
         return f"{artist} - {name}"
     return raw_title
 
+def source_badge(track: Optional[dict]) -> str:
+    """Suffix telling where a track comes from when it's not YouTube."""
+    if not isinstance(track, dict):
+        return ""
+    if track.get("is_radio"):
+        return " · 📻 Radio"
+    source_url = str(track.get("source_url") or "")
+    if "soundcloud.com" in source_url:
+        return " · SoundCloud"
+    return ""
+
 
 COMMAND_ALIASES = {
     "!h": "!help",
     "!j": "!join",
     "!lv": "!leave",
     "!p": "!play",
+    "!soundcloud": "!sc",
+    "!youtube": "!yt",
     "!q": "!queue",
     "!np": "!nowplaying",
     "!d": "!diag",
@@ -138,6 +153,8 @@ class IntegratedBot:
             audio_quality=config.AUDIO_QUALITY,
             proxy=config.PROXY,
             cookies_file=config.COOKIES_FILE or None,
+            search_source=config.SEARCH_SOURCE,
+            soundcloud_min_plays=config.SOUNDCLOUD_MIN_PLAYS,
         )
 
         self._auto_advance_task: Optional[asyncio.Task] = None
@@ -381,6 +398,8 @@ class IntegratedBot:
             "!join (!j) - join Element Call in this room\n"
             "!leave (!lv) - leave current Element Call\n"
             "!play (!p) <url-or-query> - add track and auto-join call if needed\n"
+            "!sc <query> / !yt <query> - search only SoundCloud / only YouTube\n"
+            "!radio <stream-url> - play an internet radio stream (!skip returns to the queue)\n"
             "!queue (!q) - show queue with ETA\n"
             "!nowplaying (!np) - show current track\n"
             "!skip (!s) - skip current track\n"
@@ -1107,7 +1126,7 @@ class IntegratedBot:
             generation, current_source = await self._play_track_in_worker(next_track, pre_stop=pre_stop)
             self._current_track_started_at = asyncio.get_running_loop().time()
             self._push_play_history(room_id, next_track)
-            await self.send_message(room_id, f"▶️ Now playing: {display_title(next_track)}{loop_indicator}")
+            await self.send_message(room_id, f"▶️ Now playing: {display_title(next_track)}{source_badge(next_track)}{loop_indicator}")
             self._worker_playback_task = asyncio.create_task(
                 self._wait_for_worker_playback(room_id, generation, current_source)
             )
@@ -1116,6 +1135,7 @@ class IntegratedBot:
             can_retry_stream = (
                 self.config.STREAM_RETRY_TO_FILE_ON_FAIL
                 and isinstance(next_track, dict)
+                and not next_track.get("is_radio")
                 and not next_track.get("file")
                 and isinstance(next_track.get("stream_url"), str)
             )
@@ -1156,6 +1176,9 @@ class IntegratedBot:
             "!join",
             "!leave",
             "!play",
+            "!sc",
+            "!yt",
+            "!radio",
             "!queue",
             "!nowplaying",
             "!diag",
@@ -1226,7 +1249,9 @@ class IntegratedBot:
             await self.send_message(room.room_id, "✅ Left Element Call")
             return
 
-        if command == "!play":
+        if command in ("!play", "!sc", "!yt"):
+            # !sc / !yt force the search source; !play uses audio.search_source
+            search_source = {"!sc": "soundcloud", "!yt": "youtube"}.get(command)
             if not args:
                 await self.send_message(room.room_id, "❌ Usage: !play <audio-url-or-query>")
                 return
@@ -1264,7 +1289,7 @@ class IntegratedBot:
                         playlist_ok = True
                         playlist_info = resolved
 
-                if not playlist_ok:
+                if not playlist_ok and search_source is None:
                     streamed = await self._try_stream_first_idle_play(room.room_id, args)
                     if streamed:
                         return
@@ -1373,7 +1398,7 @@ class IntegratedBot:
                         asyncio.create_task(self.send_message(room.room_id, f"🔎 Searching: {args}", priority="noisy"))
                     asyncio.create_task(self.send_message(room.room_id, "⬇️ Downloading...", priority="noisy"))
 
-                success, result = await self.audio_queue.download_audio(args)
+                success, result = await self.audio_queue.download_audio(args, source=search_source)
                 if not success:
                     await self.send_message(room.room_id, f"❌ Download failed: {result}")
                     return
@@ -1402,7 +1427,7 @@ class IntegratedBot:
                     note = " (playlist loading is paused, use `!retry`)" if self._loader_paused else ""
                     await self.send_message(
                         room.room_id,
-                        f"✅ Queued: {display_title(result) or title}\nPosition: {position}{note}",
+                        f"✅ Queued: {display_title(result) or title}{source_badge(result)}\nPosition: {position}{note}",
                     )
                     return
 
@@ -1445,7 +1470,7 @@ class IntegratedBot:
                         next_title = self._next_track_title()
                         next_line = f"\nNext: {next_title}" if next_title else ""
                         queued_message = (
-                            f"✅ Queued: {display_title(self.audio_queue.queue[-1]) or title}\n"
+                            f"✅ Queued: {display_title(self.audio_queue.queue[-1]) or title}{source_badge(result)}\n"
                             f"Position: {len(self.audio_queue.queue)}"
                             f"{eta_line}{next_line}"
                         )
@@ -1455,6 +1480,35 @@ class IntegratedBot:
                     await self.send_message(room.room_id, queued_message)
                 if should_advance:
                     await self._advance_queue(room.room_id, force_next=True)
+            return
+
+        if command == "!radio":
+            url = args.strip()
+            if not url or not self.audio_queue.looks_like_url(url):
+                await self.send_message(room.room_id, "❌ Usage: !radio <stream-url> (e.g. an Icecast/Shoutcast, .m3u, .pls or .m3u8 link)")
+                return
+            try:
+                stream_url, station = await resolve_radio_stream(url)
+            except RadioError as exc:
+                await self.send_message(room.room_id, f"❌ Radio: {exc}")
+                return
+            if not await self._join_call_for_room(room.room_id):
+                return
+            track = {
+                "title": station or urlparse(stream_url).netloc or stream_url,
+                "stream_url": stream_url,
+                "duration": None,
+                "source_url": None,
+                "non_cacheable": False,
+                "is_radio": True,
+            }
+            async with self._playback_lock:
+                # The radio interrupts the current song (like !skip); the queue continues after it
+                self.audio_queue.queue.appendleft(track)
+                self._cancel_worker_playback_wait()
+                await self._advance_queue(room.room_id, force_next=True)
+            if self.audio_queue.queue:
+                await self.send_message(room.room_id, "ℹ️ The radio plays until `!skip` or `!stop`; the queue continues after `!skip`")
             return
 
         if command == "!queue":

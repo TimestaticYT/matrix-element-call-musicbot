@@ -95,6 +95,8 @@ command_prefix = "!mb"   # e.g. "!music"; set "" for the classic "!play" style
 - `!leave` (`!lv`) - leave current Element Call
 - `!play` (`!p`) `<url-or-query>` - add track and auto-join call if needed
   - Spotify links (track, album, playlist, artist; `open.spotify.com/...`, `spotify:track:...`, `spotify.link/...`) are looked up on YouTube by artist + title, since Spotify audio is DRM-protected. Albums/playlists: first 100 tracks; podcasts are not supported.
+- `!sc <query>` / `!yt <query>` - search only SoundCloud / only YouTube
+- `!radio <stream-url>` - play an internet radio stream (Icecast/Shoutcast, `.m3u`, `.pls`, `.m3u8`); plays until `!skip`/`!stop`, then the queue continues
 - `!queue` (`!q`) - show queue with ETA
 - `!nowplaying` (`!np`) - show current track
 - `!skip` (`!s`) - skip current track
@@ -124,6 +126,16 @@ command_prefix = "!mb"   # e.g. "!music"; set "" for the classic "!play" style
 - `!diag` (`!d`) - show diagnostics
 - `!config` (`!cfg`) - show active config
 - `!defaults` (`!df`) - show default config values
+
+## YouTube or SoundCloud?
+
+`audio.search_source` decides where text searches go (links always play from where they point):
+
+- `youtube_first` (default): YouTube; if that fails (proxy down, blocked, nothing found), the best SoundCloud match.
+- `soundcloud_first`: a confident SoundCloud match (title/uploader cover the query, no unwanted remix/cover/sped-up version, at least `soundcloud_min_plays` plays), otherwise YouTube.
+- `youtube` / `soundcloud`: only that site. `!sc` and `!yt` force one for a single search.
+
+SoundCloud matches are ranked by how well uploader + title cover the search words, with play counts only breaking near-ties. 30-second previews are skipped. Note that official major-label uploads on SoundCloud are usually DRM-protected and can't be played, so for label music SoundCloud mostly finds re-uploads; it shines for music artists put there themselves (electronic, indie, DJ sets, remixes). SoundCloud never goes through `audio.proxy`, so it keeps working when the proxy is down.
 
 ## YouTube from a server (proxy, cookies, outages)
 

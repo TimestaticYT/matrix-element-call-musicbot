@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from source_picker import rank_soundcloud
+
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +35,16 @@ _PROXY_FAILURE_RE = re.compile(r"Errno 111|Connection refused|ProxyError|Unable 
 _PERMANENT_ERROR_RE = re.compile(
     r"video (?:is )?unavailable|private video|has been removed|members[- ]only|confirm your age"
     r"|not available in your country|copyright|no playable result|unsupported url|premieres in"
-    r"|live event will begin",
+    r"|live event will begin|drm protected",
     re.IGNORECASE,
 )
+
+
+# yt-dlp targets that need the proxy (YouTube blocks datacenter IPs); everything
+# else, e.g. SoundCloud, goes direct so it keeps working when the proxy is down.
+_YOUTUBE_TARGET_RE = re.compile(r"^ytsearch|(?:^|[/.])(?:youtube\.com|youtu\.be)(?:[/:?]|$)", re.IGNORECASE)
+
+SEARCH_SOURCES = ("youtube_first", "soundcloud_first", "youtube", "soundcloud")
 
 
 def is_permanent_download_error(message: object) -> bool:
@@ -64,6 +73,8 @@ class AudioQueue:
         audio_quality: str = "best",
         proxy: str = "",
         cookies_file: Optional[str] = None,
+        search_source: str = "youtube_first",
+        soundcloud_min_plays: int = 1000,
     ):
         self.audio_dir = audio_dir
         self.audio_dir.mkdir(parents=True, exist_ok=True)
@@ -94,6 +105,10 @@ class AudioQueue:
         # Cookies are only sent on the direct path (no proxy, or proxy down), so the
         # account is only exposed to yt-dlp traffic when it is actually needed.
         self.cookies_file = cookies_file or None
+        # How text searches pick between YouTube and SoundCloud (see download_audio)
+        self.search_source = search_source if search_source in SEARCH_SOURCES else "youtube_first"
+        self.soundcloud_min_plays = max(0, int(soundcloud_min_plays))
+        self._soundcloud_search_cache: dict[str, list[dict]] = {}
         # Set while the proxy is unreachable and calls fall back to a direct connection
         self.proxy_unreachable_since: Optional[float] = None
 
@@ -394,12 +409,19 @@ class AudioQueue:
             return cmd
         return [cmd[0], "--cookies", self.cookies_file, *cmd[1:]]
 
-    async def _run_ytdlp(self, cmd: list[str]) -> tuple[int, str, str]:
-        """Run yt-dlp via the proxy; if the proxy itself is unreachable, retry directly.
+    @staticmethod
+    def _targets_youtube(cmd: list[str]) -> bool:
+        return any(_YOUTUBE_TARGET_RE.search(arg) for arg in cmd[1:] if not arg.startswith("-"))
 
-        The direct attempt may well fail too (e.g. YouTube blocks the server's IP),
-        but other sites and cookie-authenticated requests can still work.
+    async def _run_ytdlp(self, cmd: list[str]) -> tuple[int, str, str]:
+        """Run yt-dlp; YouTube goes via the proxy, falling back to direct if it's unreachable.
+
+        The direct attempt may well fail too (YouTube blocks the server's IP), but
+        cookie-authenticated requests can still work. Other sites never use the
+        proxy, and cookies (a YouTube account) are only sent to YouTube.
         """
+        if not self._targets_youtube(cmd):
+            return await self._run_command(*self._without_proxy(cmd))
         if not self.proxy:
             return await self._run_command(*self._with_cookies(cmd))
 
@@ -621,7 +643,96 @@ class AudioQueue:
         title = self.normalize_title(str(title_value)) if isinstance(title_value, str) else None
         return True, {"is_playlist": True, "title": title, "entries": urls}
 
-    async def download_audio(self, query_or_url: str) -> tuple[bool, dict | str]:
+    async def search_soundcloud(self, query: str, limit: int = 8) -> list[dict]:
+        """Flat SoundCloud search (no download), cached per query. [] on errors."""
+        key = query.strip().casefold()
+        if key in self._soundcloud_search_cache:
+            return list(self._soundcloud_search_cache[key])
+        dlp_cmd = "yt-dlp" if shutil.which("yt-dlp") else "youtube-dlp"
+        cmd = [dlp_cmd, "--flat-playlist", "--dump-single-json", "--no-warnings", f"scsearch{limit}:{query}"]
+        code, stdout, stderr = await self._run_ytdlp(cmd)
+        if code != 0:
+            logger.warning("SoundCloud search failed for %r: %s", query, (stderr.strip().splitlines() or [""])[-1])
+            return []
+        try:
+            entries = json.loads(stdout).get("entries") or []
+        except (ValueError, AttributeError):
+            return []
+        results = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            url = entry.get("url") or entry.get("webpage_url")
+            if not url:
+                continue
+            results.append(
+                {
+                    "url": url,
+                    "title": entry.get("title"),
+                    "uploader": entry.get("uploader"),
+                    "duration": entry.get("duration"),
+                    "view_count": entry.get("view_count"),
+                }
+            )
+        if len(self._soundcloud_search_cache) > 500:
+            self._soundcloud_search_cache.clear()
+        self._soundcloud_search_cache[key] = results
+        return list(results)
+
+    async def _download_soundcloud_match(self, query: str, *, min_similarity: float, min_plays: int = 0):
+        """Try the best-ranked SoundCloud results in order (official label uploads are often DRM-locked)."""
+        ranked = rank_soundcloud(
+            query, await self.search_soundcloud(query), min_similarity=min_similarity, min_plays=min_plays
+        )
+        last_error = "No full-length SoundCloud match found"
+        for candidate in ranked[:3]:
+            ok, result = await self._download_target(candidate["url"])
+            if ok:
+                logger.info(
+                    "SoundCloud pick for %r: %s - %s (similarity %.2f, %s plays)",
+                    query, candidate.get("uploader"), candidate.get("title"), candidate["similarity"], candidate["plays"],
+                )
+                return ok, result
+            last_error = (str(result).strip().splitlines() or [last_error])[-1]
+            logger.info("SoundCloud candidate %s unusable: %s", candidate["url"], last_error)
+        return False, last_error
+
+    async def download_audio(self, query_or_url: str, source: Optional[str] = None) -> tuple[bool, dict | str]:
+        """Download a URL, or a text search from YouTube and/or SoundCloud.
+
+        source (default: the configured search_source) applies to text searches only:
+        - youtube_first: YouTube; if that fails (tunnel down, blocked), a close SoundCloud match
+        - soundcloud_first: a confident, popular SoundCloud match; otherwise YouTube
+        - youtube / soundcloud: only that site
+        """
+        raw = (query_or_url or "").strip()
+        mode = source if source in SEARCH_SOURCES else self.search_source
+        explicit = raw.casefold().startswith(("ytsearch", "scsearch"))
+        if not raw or explicit or self.looks_like_url(self.normalize_media_url(raw)) or mode == "youtube":
+            return await self._download_target(raw)
+
+        if mode == "soundcloud":
+            return await self._download_soundcloud_match(raw, min_similarity=0.5)
+
+        if mode == "soundcloud_first":
+            ok, result = await self._download_soundcloud_match(
+                raw, min_similarity=0.8, min_plays=self.soundcloud_min_plays
+            )
+            if ok:
+                return ok, result
+            return await self._download_target(raw)
+
+        ok, result = await self._download_target(raw)
+        if ok:
+            return ok, result
+        logger.warning("YouTube failed for %r, trying SoundCloud: %s", raw, (str(result).splitlines() or [""])[-1])
+        sc_ok, sc_result = await self._download_soundcloud_match(raw, min_similarity=0.7)
+        if sc_ok and isinstance(sc_result, dict):
+            sc_result["fallback_from"] = "YouTube"
+            return sc_ok, sc_result
+        return ok, result
+
+    async def _download_target(self, query_or_url: str) -> tuple[bool, dict | str]:
         """Download audio from URL/search with caching and pre-roll silence.
 
         Returns:

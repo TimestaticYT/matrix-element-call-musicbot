@@ -48,6 +48,8 @@ volume_percent = 100 # 0-200
 proxy = "" # leave empty to use system proxy (same as "yt-dlp --proxy $PROXY" if not empty)
 cookies_file = "" # optional Netscape cookies.txt for yt-dlp, e.g. "/app/data/youtube-cookies.txt" (must be writable).
                   # Only used when going direct: no proxy set, or the proxy is unreachable.
+search_source = "youtube_first" # text searches: youtube_first | soundcloud_first | youtube | soundcloud
+soundcloud_min_plays = 1000 # soundcloud_first: only prefer SoundCloud uploads with at least this many plays
 
 [worker]
 max_restart_attempts = 3

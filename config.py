@@ -37,6 +37,8 @@ class Config:
         "audio.stream_retry_to_file_on_fail": True,
         "audio.proxy": "",
         "audio.cookies_file": "",
+        "audio.search_source": "youtube_first",
+        "audio.soundcloud_min_plays": 1000,
         "worker.max_restart_attempts": 3,
         "worker.heartbeat_interval_seconds": 10.0,
         "worker.skip_cooldown_seconds": 1.0,
@@ -292,6 +294,15 @@ class Config:
             self.DEFAULTS["playlist.download_retries"],
         ))
         self.PROXY = self._get_str("PROXY", "audio", "proxy", self.DEFAULTS["audio.proxy"])
+        # Text searches: youtube_first | soundcloud_first | youtube | soundcloud
+        self.SEARCH_SOURCE = (
+            self._get_str("SEARCH_SOURCE", "audio", "search_source", self.DEFAULTS["audio.search_source"]) or "youtube_first"
+        ).strip().lower()
+        if self.SEARCH_SOURCE not in {"youtube_first", "soundcloud_first", "youtube", "soundcloud"}:
+            raise ValueError("SEARCH_SOURCE/audio.search_source must be youtube_first, soundcloud_first, youtube or soundcloud")
+        self.SOUNDCLOUD_MIN_PLAYS = self._get_nonnegative_int(
+            "SOUNDCLOUD_MIN_PLAYS", "audio", "soundcloud_min_plays", self.DEFAULTS["audio.soundcloud_min_plays"]
+        )
         # Netscape cookies file for yt-dlp, used only on the direct path (no proxy / proxy down)
         self.COOKIES_FILE = self._get_str("COOKIES_FILE", "audio", "cookies_file", self.DEFAULTS["audio.cookies_file"]) or ""
 
