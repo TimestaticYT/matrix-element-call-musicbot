@@ -1,3 +1,4 @@
+import re
 import asyncio
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -17,6 +18,33 @@ from saved_queues import SavedQueueStore
 
 
 logger = logging.getLogger(__name__)
+
+
+COMMAND_ALIASES = {
+    "!h": "!help",
+    "!j": "!join",
+    "!lv": "!leave",
+    "!p": "!play",
+    "!q": "!queue",
+    "!np": "!nowplaying",
+    "!d": "!diag",
+    "!a": "!audio",
+    "!norm": "!normalize",
+    "!fi": "!fadein",
+    "!v": "!volume",
+    "!hist": "!history",
+    "!s": "!skip",
+    "!lp": "!loop",
+    "!x": "!stop",
+    "!st": "!status",
+    "!sv": "!save",
+    "!ld": "!load",
+    "!qs": "!queues",
+    "!dq": "!deletequeue",
+    "!rq": "!renamequeue",
+    "!cfg": "!config",
+    "!df": "!defaults",
+}
 
 
 @dataclass(slots=True)
@@ -98,6 +126,7 @@ class IntegratedBot:
         self.client.add_event_callback(self.on_message, RoomMessageText)
         self.client.add_event_callback(self.on_invite, InviteMemberEvent)
 
+        self._command_display_re = None
         self._command_handlers: dict[str, Callable[[MatrixRoom, str], Awaitable[None]]] = {}
         self._register_command_handlers()
 
@@ -1019,32 +1048,7 @@ class IntegratedBot:
         command = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
 
-        aliases = {
-            "!h": "!help",
-            "!j": "!join",
-            "!lv": "!leave",
-            "!p": "!play",
-            "!q": "!queue",
-            "!np": "!nowplaying",
-            "!d": "!diag",
-            "!a": "!audio",
-            "!norm": "!normalize",
-            "!fi": "!fadein",
-            "!v": "!volume",
-            "!hist": "!history",
-            "!s": "!skip",
-            "!lp": "!loop",
-            "!x": "!stop",
-            "!st": "!status",
-            "!sv": "!save",
-            "!ld": "!load",
-            "!qs": "!queues",
-            "!dq": "!deletequeue",
-            "!rq": "!renamequeue",
-            "!cfg": "!config",
-            "!df": "!defaults",
-        }
-        command = aliases.get(command, command)
+        command = COMMAND_ALIASES.get(command, command)
         handler = self._command_handlers.get(command)
         if handler is None:
             await self.send_message(room.room_id, "❓ Unknown command. Use !help", priority="normal")
@@ -1713,6 +1717,16 @@ class IntegratedBot:
 
         return
 
+    def _display_commands(self, text: Optional[str]) -> Optional[str]:
+        prefix = self.config.COMMAND_PREFIX
+        if not prefix or not text:
+            return text
+        if self._command_display_re is None:
+            names = {n.lstrip("!") for n in list(self._command_handlers) + list(COMMAND_ALIASES)}
+            alt = "|".join(sorted((re.escape(n) for n in names), key=len, reverse=True))
+            self._command_display_re = re.compile(rf"(?<![\w!])!({alt})\b")
+        return self._command_display_re.sub(lambda m: f"{prefix} {m.group(1)}", text)
+
     async def send_message(
         self,
         room_id: str,
@@ -1722,6 +1736,8 @@ class IntegratedBot:
         priority: str = "normal",
     ):
         try:
+            text = self._display_commands(text)
+            html_body = self._display_commands(html_body)
             resolved_priority = priority if priority in self._message_priority_map else "normal"
             if priority == "normal":
                 if text.startswith("❌") or text.startswith("⚠️"):
@@ -1734,8 +1750,17 @@ class IntegratedBot:
         if event.sender == self.config.MATRIX_USER_ID or not self.first_sync_done:
             return
 
-        if event.body.strip().startswith("!"):
-            await self.handle_command(room, event.body)
+        body = event.body.strip()
+        prefix = self.config.COMMAND_PREFIX
+        if not prefix:
+            if body.startswith("!"):
+                await self.handle_command(room, body)
+            return
+        parts = body.split(maxsplit=1)
+        if not parts or parts[0].lower() != prefix.lower():
+            return
+        rest = parts[1].strip() if len(parts) > 1 else "help"
+        await self.handle_command(room, "!" + rest.lstrip("!"))
 
     async def start(self):
         logger.info("=" * 60)

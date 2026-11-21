@@ -16,6 +16,7 @@ access_token = "YOUR_MATRIX_ACCESS_TOKEN"
 name = "Music Bot"
 history_limit = 10
 auto_accept_invites = false
+command_prefix = "!mb" # commands look like "!mb play <query>"; set "" for classic "!play"
 
 [paths]
 audio_dir = "/tmp/musicbot_audio"

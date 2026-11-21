@@ -14,3 +14,6 @@ call_worker/node_modules/
 call_worker/.matrix-localstorage.json
 call_worker.log
 call_worker.log.*
+
+# local deployment overrides (build locally, host networking, ...)
+docker-compose.override.yml

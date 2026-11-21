@@ -79,6 +79,15 @@ Long-term fix:
 
 ## Commands
 
+### Command prefix
+
+Every command starts with a configurable prefix word so the bot does not clash with other `!` bots in the same room. The default is `!mb`, so `!play` below is typed as `!mb play` (and `!p` as `!mb p`). Sending just the prefix shows the help. Help and hint messages from the bot show the prefix automatically.
+
+```toml
+[bot]
+command_prefix = "!mb"   # e.g. "!music"; set "" for the classic "!play" style
+```
+
 ### Playback
 
 - `!help` (`!h`) - show this help

@@ -15,6 +15,7 @@ class Config:
         "bot.name": "Music Bot",
         "bot.history_limit": 10,
         "bot.auto_accept_invites": False,
+        "bot.command_prefix": "!mb",
         "paths.audio_dir": "/tmp/musicbot_audio",
         "paths.saved_queues_file": "data/saved_queues.json",
         "audio.auto_advance_buffer": 2.0,
@@ -74,6 +75,11 @@ class Config:
             "auto_accept_invites",
             self.DEFAULTS["bot.auto_accept_invites"],
         )
+        # Word every command must start with, e.g. "!mb play <query>". Empty = classic "!play".
+        self.COMMAND_PREFIX = (
+            self._get_str("COMMAND_PREFIX", "bot", "command_prefix", default=self.DEFAULTS["bot.command_prefix"])
+            or ""
+        ).strip()
         self.AUDIO_DIR = Path(
             self._get_str("AUDIO_DIR", "paths", "audio_dir", default=self.DEFAULTS["paths.audio_dir"])
             or self.DEFAULTS["paths.audio_dir"]
@@ -395,6 +401,7 @@ class Config:
             f"bot.name = {cls.DEFAULTS['bot.name']}",
             f"bot.history_limit = {cls.DEFAULTS['bot.history_limit']}",
             f"bot.auto_accept_invites = {str(cls.DEFAULTS['bot.auto_accept_invites']).lower()}",
+            f"bot.command_prefix = {cls.DEFAULTS['bot.command_prefix']}",
             f"paths.audio_dir = {cls.DEFAULTS['paths.audio_dir']}",
             f"paths.saved_queues_file = {cls.DEFAULTS['paths.saved_queues_file']}",
             f"audio.auto_advance_buffer = {cls.DEFAULTS['audio.auto_advance_buffer']}",
