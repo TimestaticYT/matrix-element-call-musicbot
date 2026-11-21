@@ -13,7 +13,7 @@ from typing import Awaitable, Callable, Optional
 from nio import AsyncClient, InviteMemberEvent, MatrixRoom, RoomMessageText
 
 from config import Config
-from audio_queue import AudioQueue
+from audio_queue import AudioQueue, is_permanent_download_error
 from call_worker_process import CallWorkerProcess
 from saved_queues import SavedQueueStore
 from spotify import SpotifyError, is_spotify_link, resolve_spotify
@@ -136,7 +136,8 @@ class IntegratedBot:
             extractor_retries=config.EXTRACTOR_RETRIES,
             download_format=config.AUDIO_DOWNLOAD_FORMAT,
             audio_quality=config.AUDIO_QUALITY,
-            proxy=config.PROXY
+            proxy=config.PROXY,
+            cookies_file=config.COOKIES_FILE or None,
         )
 
         self._auto_advance_task: Optional[asyncio.Task] = None
@@ -145,6 +146,8 @@ class IntegratedBot:
         self._background_load_task: Optional[asyncio.Task] = None
         # Playlist/saved-queue sources the background loader hasn't downloaded yet
         self._pending_sources: Optional[deque[str]] = None
+        # Set when the loader gave up after retries; !retry continues from there
+        self._loader_paused: Optional[dict] = None
         self._stream_prefetch_task: Optional[asyncio.Task] = None
         self._current_room_id: Optional[str] = None
         self._current_track_started_at: Optional[float] = None
@@ -386,6 +389,7 @@ class IntegratedBot:
             "!stop (!x) - stop playback and clear queue\n"
             "!loop (!lp) - toggle loop mode\n"
             "!shuffle (!sh) - shuffle the upcoming tracks\n"
+            "!retry [skip] - continue a paused playlist (skip: drop the failing track)\n"
             "!history (!hist) - show recent playback history\n\n"
             "Saved Queues\n"
             "!save (!sv) <name> [--force] - save current+upcoming queue\n"
@@ -767,6 +771,7 @@ class IntegratedBot:
             logger.info("Cancelled background queue loader")
         self._background_load_task = None
         self._pending_sources = None
+        self._loader_paused = None
         self._cancel_stream_prefetch()
 
     async def _wait_for_worker_playback(
@@ -862,10 +867,15 @@ class IntegratedBot:
 
         pending: deque[str] = deque(remaining_sources)
         self._pending_sources = pending
+        self._loader_paused = None
         ahead = self.config.PLAYLIST_PRELOAD_AHEAD
         parallel = self.config.PLAYLIST_BACKGROUND_LOAD_CONCURRENCY
+        retries = self.config.PLAYLIST_DOWNLOAD_RETRIES
+        retry_delays = (10, 30, 60)
+        attempt = 0
         failures = 0
         skipped_existing = 0
+        paused = False
         try:
             while pending:
                 free = ahead - len(self.audio_queue.queue)
@@ -879,11 +889,22 @@ class IntegratedBot:
                     return_exceptions=True,
                 )
 
+                stop_at: Optional[int] = None
+                error_text = ""
                 async with self._playback_lock:
-                    for result in results:
+                    for index, result in enumerate(results):
                         if isinstance(result, BaseException) or not result[0] or not isinstance(result[1], dict):
-                            failures += 1
-                            continue
+                            error = result if isinstance(result, BaseException) else result[1]
+                            if is_permanent_download_error(error):
+                                # Deleted/private/blocked video: retrying won't help, skip it
+                                logger.warning("Background loader: skipping %s: %s", batch[index], error)
+                                failures += 1
+                                continue
+                            # Network/proxy/bot-check trouble: keep this track and everything
+                            # after it in order, wait, and retry from here
+                            stop_at = index
+                            error_text = str(error)
+                            break
                         track = result[1]
                         source_url = track.get("source_url")
                         if (
@@ -903,6 +924,12 @@ class IntegratedBot:
                             metadata=track,
                         )
 
+                    if stop_at is not None:
+                        # Downloads after the failed one are cached, re-adding them is instant
+                        pending.extendleft(reversed(batch[stop_at:]))
+                    else:
+                        attempt = 0
+
                     # A skip (or a short track) can empty the queue before the next download
                     # finishes; playback has then stopped, so start the newly loaded track.
                     if (
@@ -912,14 +939,45 @@ class IntegratedBot:
                     ):
                         logger.info("Background loader: playback ran dry, starting the newly loaded track")
                         await self._advance_queue(room_id, force_next=True)
+
+                if stop_at is None:
+                    continue
+
+                attempt += 1
+                if attempt > retries:
+                    paused = True
+                    self._loader_paused = {
+                        "room_id": room_id,
+                        "name": collection_name,
+                        "label": source_label,
+                        "dedupe": dedupe_existing,
+                        "error": error_text,
+                    }
+                    short_error = (error_text.strip().splitlines() or ["unknown error"])[-1][:300]
+                    await self.send_message(
+                        room_id,
+                        f"⏸️ {source_label.capitalize()} `{collection_name}` paused: the next track failed "
+                        f"{retries + 1} times ({short_error}).\n"
+                        f"{len(pending)} track(s) are waiting. `!retry` continues where it stopped, "
+                        "`!retry skip` drops the failing track first.",
+                        priority="critical",
+                    )
+                    return
+
+                delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+                logger.warning(
+                    "Background loader: download failed (attempt %s/%s), retrying in %ss: %s",
+                    attempt, retries + 1, delay, error_text,
+                )
+                await asyncio.sleep(delay)
         finally:
-            if self._pending_sources is pending:
+            if self._pending_sources is pending and not paused:
                 self._pending_sources = None
 
         if failures or skipped_existing:
             parts = []
             if failures:
-                parts.append(f"failed: {failures}")
+                parts.append(f"skipped unavailable: {failures}")
             if skipped_existing:
                 parts.append(f"skipped already queued: {skipped_existing}")
             await self.send_message(room_id, f"⚠️ {source_label.capitalize()} `{collection_name}`: " + ", ".join(parts))
@@ -1116,6 +1174,7 @@ class IntegratedBot:
             "!resume",
             "!loop",
             "!shuffle",
+            "!retry",
             "!stop",
             "!status",
         ]
@@ -1173,8 +1232,6 @@ class IntegratedBot:
                 return
 
             async with self._play_request_lock:
-                self._cancel_background_load()
-
                 playlist_ok = False
                 playlist_info: dict | None = None
 
@@ -1241,6 +1298,17 @@ class IntegratedBot:
                         unique_sources = unique_sources[:max_tracks]
 
                     filtered_sources = [src for src in unique_sources if not self.audio_queue.has_source(src)]
+                    if self._pending_sources is not None:
+                        # A playlist is still loading (or paused): append behind it
+                        already_pending = set(self._pending_sources)
+                        new_sources = [src for src in filtered_sources if src not in already_pending]
+                        self._pending_sources.extend(new_sources)
+                        note = " (loading is paused, use `!retry`)" if self._loader_paused else ""
+                        await self.send_message(
+                            room.room_id,
+                            f"✅ Added {len(new_sources)} track(s) from `{playlist_name}` to the end of the queue{note}",
+                        )
+                        return
                     skipped_existing = len(unique_sources) - len(filtered_sources)
                     if not filtered_sources:
                         await self.send_message(
@@ -1323,6 +1391,18 @@ class IntegratedBot:
                     await self.send_message(
                         room.room_id,
                         "ℹ️ That track is already playing or queued. Use `!loop` if you want repeats.",
+                    )
+                    return
+
+                if self._pending_sources is not None and isinstance(source_url, str) and source_url:
+                    # A playlist is still loading: queue behind its remaining tracks. The file
+                    # is cached now, so the loader re-adds it instantly when it gets there.
+                    self._pending_sources.append(source_url)
+                    position = len(self.audio_queue.queue) + len(self._pending_sources)
+                    note = " (playlist loading is paused, use `!retry`)" if self._loader_paused else ""
+                    await self.send_message(
+                        room.room_id,
+                        f"✅ Queued: {display_title(result) or title}\nPosition: {position}{note}",
                     )
                     return
 
@@ -1421,7 +1501,10 @@ class IntegratedBot:
             total_label = self._format_duration(total_duration) if total_duration is not None else "unknown"
             pending_count = len(self._pending_sources) if self._pending_sources else 0
             if pending_count:
-                lines.append(f"… +{pending_count} more (downloaded as the queue plays)")
+                if self._loader_paused:
+                    lines.append(f"⏸️ +{pending_count} more, loading paused (`!retry`)")
+                else:
+                    lines.append(f"… +{pending_count} more (downloaded as the queue plays)")
                 total_label += f" + {pending_count} not yet loaded"
             lines.append("")
             lines.append(f"Total: {total_label}")
@@ -1798,6 +1881,37 @@ class IntegratedBot:
                         )
                     reply = "▶️ Resumed"
             await self.send_message(room.room_id, reply)
+            return
+
+        if command == "!retry":
+            state = self._loader_paused
+            pending = self._pending_sources
+            loader_alive = self._background_load_task is not None and not self._background_load_task.done()
+            if not state or pending is None or loader_alive:
+                await self.send_message(room.room_id, "ℹ️ No paused playlist to retry")
+                return
+            dropped = None
+            if args.strip().lower() == "skip" and pending:
+                dropped = pending.popleft()
+            if not pending:
+                self._loader_paused = None
+                self._pending_sources = None
+                await self.send_message(room.room_id, "ℹ️ Nothing left to load")
+                return
+            if not await self._join_call_for_room(state["room_id"]):
+                return
+            sources = list(pending)
+            self._background_load_task = asyncio.create_task(
+                self._load_remaining_tracks(
+                    state["room_id"],
+                    state["name"],
+                    sources,
+                    dedupe_existing=state["dedupe"],
+                    source_label=state["label"],
+                )
+            )
+            note = "Dropped the failing track. " if dropped else ""
+            await self.send_message(room.room_id, f"🔁 {note}Continuing `{state['name']}` ({len(sources)} track(s) left)")
             return
 
         if command == "!shuffle":

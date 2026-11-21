@@ -46,6 +46,8 @@ normalize_audio = false
 fade_in_ms = 120
 volume_percent = 100 # 0-200
 proxy = "" # leave empty to use system proxy (same as "yt-dlp --proxy $PROXY" if not empty)
+cookies_file = "" # optional Netscape cookies.txt for yt-dlp, e.g. "/app/data/youtube-cookies.txt" (must be writable).
+                  # Only used when going direct: no proxy set, or the proxy is unreachable.
 
 [worker]
 max_restart_attempts = 3
@@ -60,6 +62,7 @@ log_backups = 5
 max_tracks_per_request = 50
 background_load_concurrency = 4 # max parallel downloads within the preload window
 preload_ahead = 3 # tracks kept downloaded ahead in the queue (1-20); the rest download as the queue plays
+download_retries = 3 # retries (after 10s, 30s, 60s) before a failing playlist pauses; !retry continues it
 
 [logging]
 file = "logs/musicbot.log"

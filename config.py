@@ -36,6 +36,7 @@ class Config:
         "audio.stream_prefetch_current": True,
         "audio.stream_retry_to_file_on_fail": True,
         "audio.proxy": "",
+        "audio.cookies_file": "",
         "worker.max_restart_attempts": 3,
         "worker.heartbeat_interval_seconds": 10.0,
         "worker.skip_cooldown_seconds": 1.0,
@@ -46,6 +47,7 @@ class Config:
         "playlist.max_tracks_per_request": 50,
         "playlist.background_load_concurrency": 4,
         "playlist.preload_ahead": 3,
+        "playlist.download_retries": 3,
         "logging.file": "logs/musicbot.log",
         "logging.clean_enabled": True,
         "logging.clean_file": "logs/musicbot.clean.log",
@@ -281,7 +283,17 @@ class Config:
             "preload_ahead",
             self.DEFAULTS["playlist.preload_ahead"],
         )))
+        # How often the playlist loader retries a failing download (after 10s, 30s, 60s, ...)
+        # before it pauses the playlist; !retry continues from there.
+        self.PLAYLIST_DOWNLOAD_RETRIES = min(10, self._get_nonnegative_int(
+            "PLAYLIST_DOWNLOAD_RETRIES",
+            "playlist",
+            "download_retries",
+            self.DEFAULTS["playlist.download_retries"],
+        ))
         self.PROXY = self._get_str("PROXY", "audio", "proxy", self.DEFAULTS["audio.proxy"])
+        # Netscape cookies file for yt-dlp, used only on the direct path (no proxy / proxy down)
+        self.COOKIES_FILE = self._get_str("COOKIES_FILE", "audio", "cookies_file", self.DEFAULTS["audio.cookies_file"]) or ""
 
         if self.PLAYLIST_BACKGROUND_LOAD_CONCURRENCY < 1:
             raise ValueError(
@@ -444,6 +456,7 @@ class Config:
             f"playlist.max_tracks_per_request = {cls.DEFAULTS['playlist.max_tracks_per_request']}",
             f"playlist.background_load_concurrency = {cls.DEFAULTS['playlist.background_load_concurrency']}",
             f"playlist.preload_ahead = {cls.DEFAULTS['playlist.preload_ahead']}",
+            f"playlist.download_retries = {cls.DEFAULTS['playlist.download_retries']}",
             f"logging.file = {cls.DEFAULTS['logging.file']}",
             f"logging.clean_enabled = {str(cls.DEFAULTS['logging.clean_enabled']).lower()}",
             f"logging.clean_file = {cls.DEFAULTS['logging.clean_file']}",

@@ -103,6 +103,7 @@ command_prefix = "!mb"   # e.g. "!music"; set "" for the classic "!play" style
 - `!stop` (`!x`) - stop playback and clear queue
 - `!loop` (`!lp`) - toggle loop mode
 - `!shuffle` (`!sh`) - shuffle the upcoming tracks (including ones not downloaded yet)
+- `!retry` / `!retry skip` - continue a playlist that paused after repeated download failures (`skip` drops the failing track)
 - `!history` (`!hist`) - show recent playback history
 
 ### Saved Queues
@@ -123,6 +124,17 @@ command_prefix = "!mb"   # e.g. "!music"; set "" for the classic "!play" style
 - `!diag` (`!d`) - show diagnostics
 - `!config` (`!cfg`) - show active config
 - `!defaults` (`!df`) - show default config values
+
+## YouTube from a server (proxy, cookies, outages)
+
+YouTube blocks many datacenter IPs ("Sign in to confirm you're not a bot"). Options:
+
+- `audio.proxy` - route yt-dlp through a residential connection, e.g. `socks5h://127.0.0.1:1080` from a reverse SSH tunnel (`ssh -N -R 127.0.0.1:1080 user@server` run at home gives the server a SOCKS proxy that exits through your home connection). With a proxy, set `stream_first_idle = false` and `stream_prefetch_current = false`: YouTube stream URLs only work from the IP that requested them, so tracks are downloaded through the proxy instead.
+- `audio.cookies_file` - optional cookies.txt of a (throwaway) YouTube account. It is only used on the direct path: when no proxy is set, or when the proxy is unreachable. Keep it somewhere writable (e.g. `/app/data/`), yt-dlp updates it.
+
+If the proxy is unreachable, every yt-dlp call is retried directly (with cookies if configured); other sites like SoundCloud keep working either way.
+
+Playlists never silently lose tracks: a failing download is retried `playlist.download_retries` times (after 10s, 30s, 60s). If it still fails, loading pauses where it stopped while already loaded tracks keep playing; `!retry` continues from there. Only videos that are gone for good (deleted, private, region-blocked) are skipped. Songs you `!play` while a playlist is loading are queued behind it instead of cancelling it.
 
 ## Docker (Prebuilt Image, Recommended)
 

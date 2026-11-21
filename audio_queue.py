@@ -3,8 +3,10 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
+import time
 import wave
 from collections import deque
 from pathlib import Path
@@ -23,6 +25,22 @@ YTDLP_AUDIO_FORMAT_MAP = {
 }
 
 YTDLP_JS_RUNTIME = ["--js-runtimes", "node"]
+
+# yt-dlp output meaning the configured proxy itself could not be reached
+# (e.g. the reverse SSH tunnel is down): worth retrying the same call directly.
+_PROXY_FAILURE_RE = re.compile(r"Errno 111|Connection refused|ProxyError|Unable to connect to proxy|socks", re.IGNORECASE)
+# Errors that will not go away by retrying later: skip the track instead of pausing.
+_PERMANENT_ERROR_RE = re.compile(
+    r"video (?:is )?unavailable|private video|has been removed|members[- ]only|confirm your age"
+    r"|not available in your country|copyright|no playable result|unsupported url|premieres in"
+    r"|live event will begin",
+    re.IGNORECASE,
+)
+
+
+def is_permanent_download_error(message: object) -> bool:
+    """True for errors like "Video unavailable" that retrying won't fix."""
+    return bool(_PERMANENT_ERROR_RE.search(str(message or "")))
 # yt-dlp fields used to show "Artist - Track" in chat
 TRACK_METADATA_KEYS = ("artist", "track", "album", "channel")
 
@@ -44,7 +62,8 @@ class AudioQueue:
         extractor_retries: int = 1,
         download_format: str = "wav",
         audio_quality: str = "best",
-        proxy: str = ""
+        proxy: str = "",
+        cookies_file: Optional[str] = None,
     ):
         self.audio_dir = audio_dir
         self.audio_dir.mkdir(parents=True, exist_ok=True)
@@ -72,6 +91,11 @@ class AudioQueue:
         if self.audio_quality not in {"best", "medium", "worst"}:
             self.audio_quality = "best"
         self.proxy = proxy
+        # Cookies are only sent on the direct path (no proxy, or proxy down), so the
+        # account is only exposed to yt-dlp traffic when it is actually needed.
+        self.cookies_file = cookies_file or None
+        # Set while the proxy is unreachable and calls fall back to a direct connection
+        self.proxy_unreachable_since: Optional[float] = None
 
         # Cache shape: {url: {"file": str, "music_duration": Optional[float]}}
         self.download_cache = {}
@@ -348,6 +372,55 @@ class AudioQueue:
         stdout, stderr = await process.communicate()
         return (process.returncode if process.returncode is not None else -1), stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
 
+    @staticmethod
+    def _without_proxy(cmd: list[str]) -> list[str]:
+        out: list[str] = []
+        skip_next = False
+        for arg in cmd:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == "--proxy":
+                skip_next = True
+                continue
+            out.append(arg)
+        return out
+
+    def _with_cookies(self, cmd: list[str]) -> list[str]:
+        if not self.cookies_file:
+            return cmd
+        if not os.path.isfile(self.cookies_file):
+            logger.warning("Cookies file %s not found, going without", self.cookies_file)
+            return cmd
+        return [cmd[0], "--cookies", self.cookies_file, *cmd[1:]]
+
+    async def _run_ytdlp(self, cmd: list[str]) -> tuple[int, str, str]:
+        """Run yt-dlp via the proxy; if the proxy itself is unreachable, retry directly.
+
+        The direct attempt may well fail too (e.g. YouTube blocks the server's IP),
+        but other sites and cookie-authenticated requests can still work.
+        """
+        if not self.proxy:
+            return await self._run_command(*self._with_cookies(cmd))
+
+        code, stdout, stderr = await self._run_command(*cmd)
+        if code == 0:
+            if self.proxy_unreachable_since is not None:
+                logger.info("Proxy %s reachable again", self.proxy)
+            self.proxy_unreachable_since = None
+            return code, stdout, stderr
+        if not _PROXY_FAILURE_RE.search(stderr or stdout):
+            return code, stdout, stderr
+
+        if self.proxy_unreachable_since is None:
+            self.proxy_unreachable_since = time.time()
+        logger.warning("Proxy %s unreachable, retrying yt-dlp directly", self.proxy)
+        direct_code, direct_out, direct_err = await self._run_command(*self._with_cookies(self._without_proxy(cmd)))
+        if direct_code == 0:
+            return direct_code, direct_out, direct_err
+        last_line = (direct_err.strip().splitlines() or ["unknown error"])[-1]
+        return direct_code, direct_out, f"Proxy unreachable and direct download failed: {last_line}"
+
     async def _resolve_media_info(self, dlp_cmd: str, query_or_url: str) -> tuple[bool, dict | str]:
         is_url = self.looks_like_url(query_or_url)
         target = query_or_url if is_url else f"ytsearch1:{query_or_url}"
@@ -365,7 +438,7 @@ class AudioQueue:
         cmd.extend(self._yt_dlp_proxy_cla())
         cmd.append(target)
 
-        code, stdout, stderr = await self._run_command(*cmd)
+        code, stdout, stderr = await self._run_ytdlp(cmd)
         if code != 0:
             return False, (stderr.strip() or "Failed to resolve media info")
 
@@ -462,7 +535,7 @@ class AudioQueue:
         cmd.extend(self._yt_dlp_proxy_cla())
         cmd.append(target)
 
-        code, stdout, stderr = await self._run_command(*cmd)
+        code, stdout, stderr = await self._run_ytdlp(cmd)
         if code != 0:
             return False, (stderr.strip() or "Failed to resolve stream URL")
         lines = [line.strip() for line in stdout.splitlines() if line.strip()]
@@ -504,7 +577,7 @@ class AudioQueue:
         cmd.extend(self._yt_dlp_proxy_cla())
         cmd.append(candidate)
 
-        code, stdout, stderr = await self._run_command(*cmd)
+        code, stdout, stderr = await self._run_ytdlp(cmd)
         if code != 0:
             return False, (stderr.strip() or "Failed to resolve playlist metadata")
 
@@ -650,11 +723,10 @@ class AudioQueue:
         )
 
         try:
-            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            _, stderr = await process.communicate()
+            returncode, _, stderr = await self._run_ytdlp(cmd)
 
-            if process.returncode != 0:
-                error_msg = stderr.decode().strip() if stderr else "Unknown error"
+            if returncode != 0:
+                error_msg = stderr.strip() or "Unknown error"
                 logger.error(f"yt-dlp failed: {error_msg}")
                 return False, error_msg
 
