@@ -486,7 +486,9 @@ class CallWorker {
         }
 
         const room = new Room();
-        await room.connect(config.url, config.jwt, { autoSubscribe: true, dynacast: true });
+        // The bot only publishes music; it never needs other participants' audio,
+        // so don't receive their tracks at all.
+        await room.connect(config.url, config.jwt, { autoSubscribe: false, dynacast: true });
         logLine(`livekit connected auth_mode=${config._auth_mode || "unknown"}`);
 
         this.audioSource = new AudioSource(SAMPLE_RATE, CHANNELS);
@@ -842,6 +844,12 @@ async function main() {
     sessionManager.start();
 
     const session = sessionManager.getRoomSession(room);
+    // If startup fails after this point (e.g. the LiveKit JWT service returns 503),
+    // leave the MatrixRTC session so the bot doesn't linger in the call as a ghost.
+    fatalCleanup = async () => {
+        await leaveRtcSession(session, 5_000);
+        client.stopClient();
+    };
 
     let effectiveMembershipMode = membershipMode;
     session.on(MatrixRTCSessionEvent.MembershipManagerError, (error) => {
@@ -991,9 +999,20 @@ async function main() {
     await shutdown();
 }
 
-main().catch((error) => {
+// Set in main() once the MatrixRTC session exists.
+let fatalCleanup = null;
+
+main().catch(async (error) => {
     emit({ event: "error", message: error instanceof Error ? error.message : String(error) });
     logLine(`fatal ${error instanceof Error ? error.stack || error.message : String(error)}`);
-    logStream.end();
-    process.exitCode = 1;
+    if (fatalCleanup) {
+        try {
+            await Promise.race([fatalCleanup(), new Promise((resolve) => setTimeout(resolve, 8_000))]);
+        } catch (cleanupError) {
+            logLine(`fatal cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+        }
+    }
+    // The Matrix client keeps the event loop alive, so exitCode alone would leave
+    // a half-started worker running (in the call, but without LiveKit audio).
+    logStream.end(() => process.exit(1));
 });
