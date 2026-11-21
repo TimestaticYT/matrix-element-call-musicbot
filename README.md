@@ -94,6 +94,7 @@ command_prefix = "!mb"   # e.g. "!music"; set "" for the classic "!play" style
 - `!join` (`!j`) - join Element Call in this room
 - `!leave` (`!lv`) - leave current Element Call
 - `!play` (`!p`) `<url-or-query>` - add track and auto-join call if needed
+  - Spotify links (track, album, playlist, artist; `open.spotify.com/...`, `spotify:track:...`, `spotify.link/...`) are looked up on YouTube by artist + title, since Spotify audio is DRM-protected. Albums/playlists: first 100 tracks; podcasts are not supported.
 - `!queue` (`!q`) - show queue with ETA
 - `!nowplaying` (`!np`) - show current track
 - `!skip` (`!s`) - skip current track
