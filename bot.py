@@ -34,6 +34,9 @@ COMMAND_ALIASES = {
     "!v": "!volume",
     "!hist": "!history",
     "!s": "!skip",
+    "!ps": "!pause",
+    "!unpause": "!resume",
+    "!rs": "!resume",
     "!lp": "!loop",
     "!x": "!stop",
     "!st": "!status",
@@ -87,6 +90,8 @@ class IntegratedBot:
         self._stream_prefetch_task: Optional[asyncio.Task] = None
         self._current_room_id: Optional[str] = None
         self._current_track_started_at: Optional[float] = None
+        # Loop time when playback was paused (None = not paused)
+        self._paused_at: Optional[float] = None
         self._playback_generation = 0
         self._playback_lock = asyncio.Lock()
         self._play_request_lock = asyncio.Lock()
@@ -215,7 +220,7 @@ class IntegratedBot:
                     continue
                 if not self.audio_queue.current or not self.audio_queue.queue:
                     continue
-                if self._current_track_started_at is None:
+                if self._current_track_started_at is None or self._paused_at is not None:
                     continue
 
                 duration = self.audio_queue.current.get("duration")
@@ -303,7 +308,7 @@ class IntegratedBot:
         if self._current_track_started_at is None:
             return None
 
-        now = asyncio.get_running_loop().time()
+        now = self._paused_at if self._paused_at is not None else asyncio.get_running_loop().time()
         elapsed = max(0.0, now - self._current_track_started_at)
         return max(0.0, float(duration) - elapsed)
 
@@ -318,6 +323,8 @@ class IntegratedBot:
             "!queue (!q) - show queue with ETA\n"
             "!nowplaying (!np) - show current track\n"
             "!skip (!s) - skip current track\n"
+            "!pause (!ps) - pause; again to resume\n"
+            "!resume (!rs) - resume after pause\n"
             "!stop (!x) - stop playback and clear queue\n"
             "!loop (!lp) - toggle loop mode\n"
             "!history (!hist) - show recent playback history\n\n"
@@ -412,6 +419,7 @@ class IntegratedBot:
         return None
 
     async def _play_track_in_worker(self, track: dict, *, pre_stop: bool = True) -> tuple[int, Optional[str]]:
+        self._paused_at = None
         should_wait_stop = pre_stop and self.call_worker.state == "playing"
         if should_wait_stop:
             await self.call_worker.stop_playback(wait_for_terminal=True, timeout=3.0)
@@ -1034,6 +1042,8 @@ class IntegratedBot:
             "!renamequeue",
             "!load",
             "!skip",
+            "!pause",
+            "!resume",
             "!loop",
             "!stop",
             "!status",
@@ -1081,6 +1091,7 @@ class IntegratedBot:
             self._cancel_worker_playback_wait()
             self._cancel_background_load()
             self._current_track_started_at = None
+            self._paused_at = None
             await self.call_worker.stop()
             await self.send_message(room.room_id, "✅ Left Element Call")
             return
@@ -1644,6 +1655,40 @@ class IntegratedBot:
                 await self.send_message(room.room_id, "📭 Queue is empty")
             return
 
+        if command in ("!pause", "!resume"):
+            if not await self._require_joined_in_room_call(room.room_id, command):
+                return
+            loop = asyncio.get_running_loop()
+            async with self._playback_lock:
+                paused = self._paused_at is not None
+                if command == "!pause" and not paused:
+                    if not self.audio_queue.current or self._current_track_started_at is None:
+                        reply = "ℹ️ Nothing is playing"
+                    else:
+                        self._cancel_auto_advance()
+                        self._paused_at = loop.time()
+                        await self.call_worker.pause_playback()
+                        reply = "⏸️ Paused. `!pause` or `!resume` to continue"
+                elif not paused:
+                    reply = "ℹ️ Not paused"
+                else:
+                    # Shift the start time by the pause length so ETA and auto-advance ignore the pause
+                    self._current_track_started_at += loop.time() - self._paused_at
+                    self._paused_at = None
+                    await self.call_worker.resume_playback()
+                    current = self.audio_queue.current
+                    duration = current.get("duration") if current else None
+                    if duration is not None:
+                        elapsed = loop.time() - self._current_track_started_at
+                        self._arm_auto_advance(
+                            max(0.0, float(duration) - elapsed),
+                            self._current_room_id or room.room_id,
+                            expected_source=self._track_source_ref(current),
+                        )
+                    reply = "▶️ Resumed"
+            await self.send_message(room.room_id, reply)
+            return
+
         if command == "!loop":
             if not await self._require_joined_in_room_call(room.room_id, "!loop"):
                 return
@@ -1682,6 +1727,7 @@ class IntegratedBot:
             self.audio_queue.current = None
             self._current_room_id = None
             self._current_track_started_at = None
+            self._paused_at = None
             for track in tracks_to_cleanup:
                 self.audio_queue.maybe_delete_track_file(track, trigger="after_playback")
             await self.call_worker.stop_playback(wait_for_terminal=True)

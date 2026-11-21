@@ -97,6 +97,8 @@ command_prefix = "!mb"   # e.g. "!music"; set "" for the classic "!play" style
 - `!queue` (`!q`) - show queue with ETA
 - `!nowplaying` (`!np`) - show current track
 - `!skip` (`!s`) - skip current track
+- `!pause` (`!ps`) - pause; send again to resume
+- `!resume` (`!rs`) - resume after pause
 - `!stop` (`!x`) - stop playback and clear queue
 - `!loop` (`!lp`) - toggle loop mode
 - `!history` (`!hist`) - show recent playback history
